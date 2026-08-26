@@ -268,3 +268,53 @@ def test_lightflow_hooks_can_replace_step_query_and_trace_decision():
     assert result.success is True
     assert agent.calls[0]["query"] == "rewritten by flow hook"
     assert any(event["type"] == "hook_decision" for event in result.trace)
+
+
+class CancellingAgent(FakeAgent):
+    """An agent that calls flow.cancel() while the flow is executing its step."""
+
+    def __init__(self, name, flow_holder):
+        super().__init__(name, ["done"])
+        self._flow_holder = flow_holder
+
+    def run(self, query, **kwargs):
+        self.calls.append({"query": query, "kwargs": kwargs})
+        self._flow_holder["flow"].cancel()
+        return RunResult(content="cancelled mid-run", trace=[])
+
+
+def test_lightflow_cancel_during_run_skips_remaining_steps_of_that_run():
+    flow_holder = {}
+    first = CancellingAgent("first", flow_holder)
+    second = FakeAgent("second", ["done"])
+    flow = LightFlow().step("first", agent=first).step("second", agent=second, depends_on=["first"])
+    flow_holder["flow"] = flow
+
+    result = flow.run("go")
+
+    statuses = {step.name: step.status for step in result.steps}
+    assert statuses == {"first": "success", "second": "skipped"}
+    assert second.calls == []
+
+
+def test_lightflow_cancel_between_runs_does_not_poison_the_next_run():
+    """Regression: cancel() set a sticky _cancelled flag that was never reset,
+    so a subsequent run()/resume()/rerun_step() on the same instance skipped
+    every step. The flag must be cleared at the start of each execution while
+    still being honored for the run in progress."""
+    first = FakeAgent("first", ["one", "two"])
+    second = FakeAgent("second", ["one", "two"])
+    flow = LightFlow().step("first", agent=first).step("second", agent=second, depends_on=["first"])
+
+    first_run = flow.run("first")
+    assert first_run.success is True
+    assert len(first.calls) == 1 and len(second.calls) == 1
+
+    flow.cancel()  # e.g. user cancels after the run has already finished
+
+    second_run = flow.run("second")
+    assert second_run.success is True, [
+        (step.name, step.status, step.error) for step in second_run.steps
+    ]
+    assert [step.status for step in second_run.steps] == ["success", "success"]
+    assert len(first.calls) == 2 and len(second.calls) == 2

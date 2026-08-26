@@ -401,6 +401,12 @@ class LightFlow:
             parent_trace_id: str | None = None,
             run_group_id: str | None = None,
     ) -> LightFlowResult | str | dict[str, Any]:
+        # A new execution must not inherit the cancellation state of a previous
+        # run on the same LightFlow instance. cancel() is still honored for the
+        # currently executing run because the flag is re-checked before every
+        # step below; resetting it here only prevents it from permanently
+        # poisoning subsequent run()/resume()/rerun_step() calls.
+        self._cancelled = False
         trace_id = uuid4().hex
         run_group = run_group_id or run_id
         recorder = TraceRecorder(enabled=trace, trace_id=trace_id, parent_trace_id=parent_trace_id, run_group_id=run_group)
