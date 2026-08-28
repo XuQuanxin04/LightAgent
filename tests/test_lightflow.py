@@ -268,3 +268,31 @@ def test_lightflow_hooks_can_replace_step_query_and_trace_decision():
     assert result.success is True
     assert agent.calls[0]["query"] == "rewritten by flow hook"
     assert any(event["type"] == "hook_decision" for event in result.trace)
+
+
+def test_lightflow_step_timeout_bounds_wall_clock_when_agent_hangs():
+    """Regression: a step `timeout` must bound how long run() blocks. The
+    worker ThreadPoolExecutor was shut down via its context manager
+    (shutdown(wait=True)) on timeout, so run() stayed blocked until the hung
+    agent returned, defeating the timeout and delaying/failing fallback."""
+    class HangingAgent(FakeAgent):
+        def run(self, query, **kwargs):
+            self.calls.append({"query": query})
+            time.sleep(0.5)  # far longer than the 0.05s timeout
+            return RunResult(content="too late")
+
+    fallback = FakeAgent("fallback", ["fallback done"])
+    flow = LightFlow().step(
+        "work", agent=HangingAgent("hang", []), timeout=0.05, fallback_agent=fallback
+    )
+
+    start = time.perf_counter()
+    result = flow.run("hello")
+    elapsed = time.perf_counter() - start
+
+    assert result.success is True
+    assert result.content == "fallback done"
+    assert result.steps[0].used_fallback is True
+    # Must return near the timeout, not after the agent's 0.5s hang.
+    assert elapsed < 0.25, f"run blocked {elapsed:.2f}s despite a 0.05s timeout"
+

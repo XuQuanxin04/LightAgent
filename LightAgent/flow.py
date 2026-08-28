@@ -763,13 +763,23 @@ class LightFlow:
         }
         if step.timeout is None:
             return agent.run(query, **kwargs), False
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(agent.run, query, **kwargs)
-            try:
-                return future.result(timeout=step.timeout), False
-            except TimeoutError:
-                future.cancel()
-                return None, True
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(agent.run, query, **kwargs)
+        try:
+            result = future.result(timeout=step.timeout)
+        except TimeoutError:
+            # Do not block waiting for the still-running worker: the context
+            # manager's shutdown(wait=True) would keep flow.run() blocked until
+            # a hung agent returns, defeating the timeout. Detach instead so the
+            # step can fail fast and retry/fallback can engage; the orphaned
+            # task winds down in the background (a Python thread cannot be
+            # force-killed).
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            return None, True
+        # The task finished in time; reclaim the worker promptly.
+        executor.shutdown(wait=True)
+        return result, False
 
     def _run_flow_hook(
             self,
