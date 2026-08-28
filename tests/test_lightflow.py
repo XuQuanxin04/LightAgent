@@ -268,3 +268,79 @@ def test_lightflow_hooks_can_replace_step_query_and_trace_decision():
     assert result.success is True
     assert agent.calls[0]["query"] == "rewritten by flow hook"
     assert any(event["type"] == "hook_decision" for event in result.trace)
+
+
+class RaisingAgent:
+    """An agent whose run() raises; simulates real LLM agents that raise on
+    API/network failures rather than returning a RunResult with an error."""
+
+    def __init__(self, name, failures, success="recovered"):
+        self.name = name
+        self._failures = failures
+        self._success = success
+        self.calls = []
+
+    def run(self, query, **kwargs):
+        self.calls.append({"query": query})
+        if self._failures > 0:
+            self._failures -= 1
+            raise RuntimeError("transient API error")
+        return self._success
+
+
+def test_lightflow_retries_when_agent_raises():
+    """Regression: a raised exception previously propagated out of run() on the
+    first attempt, so max_retry never engaged for agents that raise (the common
+    case for API/network errors). It must be treated as a failed attempt."""
+    flaky = RaisingAgent("flaky", failures=2, success="recovered")
+    flow = LightFlow().step("flaky", agent=flaky, max_retry=3)
+
+    result = flow.run("try it")
+
+    assert result.success is True
+    assert result.content == "recovered"
+    assert len(flaky.calls) == 3
+    assert result.steps[0].attempts == 3
+
+
+def test_lightflow_fallback_runs_when_agent_always_raises():
+    class AlwaysRaises:
+        name = "always"
+
+        def run(self, query, **kwargs):
+            raise RuntimeError("permanent failure")
+
+    fallback = FakeAgent("fallback", ["fallback done"])
+    flow = LightFlow().step("work", agent=AlwaysRaises(), max_retry=2, fallback_agent=fallback)
+
+    result = flow.run("go")
+
+    assert result.success is True
+    assert result.content == "fallback done"
+    assert result.steps[0].used_fallback is True
+    assert len(fallback.calls) == 1
+
+
+def test_lightflow_marks_step_failed_when_agent_always_raises_without_fallback():
+    class AlwaysRaises:
+        name = "always"
+
+        def run(self, query, **kwargs):
+            raise RuntimeError("permanent failure")
+
+    downstream = FakeAgent("downstream", ["should not run"])
+    flow = (
+        LightFlow()
+        .step("failing", agent=AlwaysRaises(), max_retry=2)
+        .step("downstream", agent=downstream, depends_on=["failing"])
+    )
+
+    result = flow.run("go")
+
+    assert result.success is False
+    assert "RuntimeError" in result.error
+    assert result.steps[0].status == "failed"
+    assert result.steps[0].attempts == 2
+    assert result.steps[1].status == "skipped"
+    assert downstream.calls == []
+

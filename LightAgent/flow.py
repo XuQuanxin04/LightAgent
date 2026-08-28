@@ -677,19 +677,28 @@ class LightFlow:
         started = time.perf_counter()
         last_result: LightFlowStepResult | None = None
         for attempt in range(1, step.max_retry + 1):
-            raw_result, timed_out = self._call_agent(
-                step.agent,
-                step,
-                query,
-                user_id=user_id,
-                trace=trace,
-                parent_trace_id=parent_trace_id,
-                run_group_id=run_group_id,
-            )
-            content, error, step_trace = self._normalize_agent_result(raw_result)
-            if timed_out:
-                error = f"step `{step.name}` timed out after {step.timeout} seconds"
-                content = f"[LA-FLOW-TIMEOUT] {error}"
+            try:
+                raw_result, timed_out = self._call_agent(
+                    step.agent,
+                    step,
+                    query,
+                    user_id=user_id,
+                    trace=trace,
+                    parent_trace_id=parent_trace_id,
+                    run_group_id=run_group_id,
+                )
+            except Exception as exc:  # agent.run raised - count as a failed attempt
+                raw_result, timed_out = None, False
+                content = (
+                    f"[LA-FLOW-AGENT-ERROR] step `{step.name}` agent raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                error, step_trace = content, []
+            else:
+                content, error, step_trace = self._normalize_agent_result(raw_result)
+                if timed_out:
+                    error = f"step `{step.name}` timed out after {step.timeout} seconds"
+                    content = f"[LA-FLOW-TIMEOUT] {error}"
             ended = time.perf_counter()
             last_result = LightFlowStepResult(
                 name=step.name,
@@ -709,19 +718,28 @@ class LightFlow:
                 return last_result
 
         if last_result and last_result.error and step.fallback_agent is not None:
-            fallback_result, timed_out = self._call_agent(
-                step.fallback_agent,
-                step,
-                query,
-                user_id=user_id,
-                trace=trace,
-                parent_trace_id=parent_trace_id,
-                run_group_id=run_group_id,
-            )
-            content, error, step_trace = self._normalize_agent_result(fallback_result)
-            if timed_out:
-                error = f"fallback for step `{step.name}` timed out after {step.timeout} seconds"
-                content = f"[LA-FLOW-TIMEOUT] {error}"
+            try:
+                fallback_result, timed_out = self._call_agent(
+                    step.fallback_agent,
+                    step,
+                    query,
+                    user_id=user_id,
+                    trace=trace,
+                    parent_trace_id=parent_trace_id,
+                    run_group_id=run_group_id,
+                )
+            except Exception as exc:  # fallback agent raised - surface as a failed step
+                fallback_result, timed_out = None, False
+                content = (
+                    f"[LA-FLOW-AGENT-ERROR] fallback for step `{step.name}` agent raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                error, step_trace = content, []
+            else:
+                content, error, step_trace = self._normalize_agent_result(fallback_result)
+                if timed_out:
+                    error = f"fallback for step `{step.name}` timed out after {step.timeout} seconds"
+                    content = f"[LA-FLOW-TIMEOUT] {error}"
             ended = time.perf_counter()
             return LightFlowStepResult(
                 name=step.name,
