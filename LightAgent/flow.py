@@ -777,6 +777,11 @@ class LightFlow:
             future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
             return None, True
+        except BaseException:
+            # Reclaim the worker before propagating agent failures. PR #98 may
+            # normalize the exception into retry/fallback behavior upstream.
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
         # The task finished in time; reclaim the worker promptly.
         executor.shutdown(wait=True)
         return result, False

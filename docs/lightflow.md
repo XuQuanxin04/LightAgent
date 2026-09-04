@@ -108,6 +108,14 @@ flow.step(
 )
 ```
 
+Step timeouts are best-effort soft wall-clock bounds: Python cannot safely
+terminate a running worker thread, so a timed-out `agent.run()` may finish in
+the background while a configured retry or fallback starts. Timeout retries
+therefore have at-least-once semantics and can overlap, potentially repeating
+requests, charges, or side effects. Agents used with timeouts should support
+cooperative cancellation where possible and make externally visible
+operations idempotent.
+
 v0.9.6 approval handlers may also return `ApprovalDecision.approve()`,
 `reject()`, `edit({"query": "..."})`, or `respond("...")`. Boolean handlers
 remain compatible.

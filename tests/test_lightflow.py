@@ -1,5 +1,11 @@
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+
+import pytest
+
+import LightAgent.flow as flow_module
 
 from LightAgent import HookDecision, JsonLightFlowStore, LightFlow, LightFlowResult, RunResult
 
@@ -295,4 +301,92 @@ def test_lightflow_step_timeout_bounds_wall_clock_when_agent_hangs():
     assert result.steps[0].used_fallback is True
     # Must return near the timeout, not after the agent's 0.5s hang.
     assert elapsed < 0.25, f"run blocked {elapsed:.2f}s despite a 0.05s timeout"
+
+
+def test_lightflow_timeout_retries_have_at_least_once_overlap_semantics():
+    lock = Lock()
+    release = Event()
+    two_started = Event()
+    active = 0
+    max_active = 0
+
+    class BlockingAgent(FakeAgent):
+        def run(self, query, **kwargs):
+            nonlocal active, max_active
+            self.calls.append({"query": query})
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    two_started.set()
+            try:
+                assert release.wait(timeout=1)
+                return RunResult(content="late")
+            finally:
+                with lock:
+                    active -= 1
+
+    agent = BlockingAgent("blocking", [])
+    flow = LightFlow().step("work", agent=agent, timeout=0.01, max_retry=2)
+
+    try:
+        result = flow.run("hello")
+        assert result.success is False
+        assert result.steps[0].attempts == 2
+        assert len(agent.calls) == 2
+        assert two_started.is_set()
+        assert max_active == 2
+    finally:
+        release.set()
+
+
+def test_lightflow_timeout_can_start_fallback_while_call_is_in_flight():
+    release = Event()
+    fallback_saw_primary_in_flight = []
+
+    class BlockingAgent(FakeAgent):
+        def run(self, query, **kwargs):
+            self.calls.append({"query": query})
+            assert release.wait(timeout=1)
+            return RunResult(content="late")
+
+    class ObservingFallback(FakeAgent):
+        def run(self, query, **kwargs):
+            fallback_saw_primary_in_flight.append(not release.is_set())
+            return super().run(query, **kwargs)
+
+    fallback = ObservingFallback("fallback", ["fallback done"])
+    flow = LightFlow().step(
+        "work", agent=BlockingAgent("blocking", []), timeout=0.01, fallback_agent=fallback
+    )
+
+    try:
+        result = flow.run("hello")
+        assert result.success is True
+        assert len(fallback.calls) == 1
+        assert result.steps[0].used_fallback is True
+        assert fallback_saw_primary_in_flight == [True]
+    finally:
+        release.set()
+
+
+def test_lightflow_timed_agent_exception_shuts_down_executor(monkeypatch):
+    shutdown_calls = []
+
+    class TrackingExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdown_calls.append((wait, cancel_futures))
+            return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    class RaisingAgent(FakeAgent):
+        def run(self, query, **kwargs):
+            raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(flow_module, "ThreadPoolExecutor", TrackingExecutor)
+    flow = LightFlow().step("work", agent=RaisingAgent("raising", []), timeout=1)
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        flow.run("hello")
+
+    assert shutdown_calls == [(True, True)]
 
