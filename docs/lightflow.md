@@ -108,6 +108,13 @@ flow.step(
 )
 ```
 
+`flow.cancel()` cancels every execution that is active on that `LightFlow`
+instance. Cancellation is checked before each step; it does not interrupt an
+agent call already in progress. Calling `cancel()` when no execution is active
+is a no-op and does not affect a later `run()`, `resume()`, or `rerun_step()`.
+For independent cancellation control, use a separate `LightFlow` instance per
+concurrent execution.
+
 v0.9.6 approval handlers may also return `ApprovalDecision.approve()`,
 `reject()`, `edit({"query": "..."})`, or `respond("...")`. Boolean handlers
 remain compatible.

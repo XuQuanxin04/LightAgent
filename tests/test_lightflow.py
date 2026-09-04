@@ -1,5 +1,7 @@
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 
 from LightAgent import HookDecision, JsonLightFlowStore, LightFlow, LightFlowResult, RunResult
 
@@ -318,3 +320,58 @@ def test_lightflow_cancel_between_runs_does_not_poison_the_next_run():
     ]
     assert [step.status for step in second_run.steps] == ["success", "success"]
     assert len(first.calls) == 2 and len(second.calls) == 2
+
+
+def test_lightflow_cancel_between_run_invocation_and_execute_entry():
+    class DelayedExecuteFlow(LightFlow):
+        def __init__(self):
+            super().__init__()
+            self.entered_execute = Event()
+            self.continue_execute = Event()
+
+        def _execute(self, **kwargs):
+            self.entered_execute.set()
+            assert self.continue_execute.wait(timeout=1)
+            return super()._execute(**kwargs)
+
+    agent = FakeAgent("worker", ["should not run"])
+    flow = DelayedExecuteFlow().step("work", agent=agent)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(flow.run, "go")
+        assert flow.entered_execute.wait(timeout=1)
+        flow.cancel()
+        flow.continue_execute.set()
+        result = future.result(timeout=1)
+
+    assert result.steps[0].status == "skipped"
+    assert agent.calls == []
+
+
+def test_lightflow_cancel_cancels_all_current_concurrent_executions():
+    started = Barrier(3)
+    release = Event()
+
+    class BlockingAgent(FakeAgent):
+        def run(self, query, **kwargs):
+            self.calls.append({"query": query, "kwargs": kwargs})
+            started.wait(timeout=1)
+            assert release.wait(timeout=1)
+            return RunResult(content="first done", trace=[])
+
+    first = BlockingAgent("first", [])
+    second = FakeAgent("second", ["one", "two"])
+    flow = LightFlow().step("first", agent=first).step(
+        "second", agent=second, depends_on=["first"]
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(flow.run, f"run-{index}") for index in range(2)]
+        started.wait(timeout=1)
+        flow.cancel()
+        release.set()
+        results = [future.result(timeout=1) for future in futures]
+
+    assert all(result.steps[-1].status == "skipped" for result in results)
+    assert len(first.calls) == 2
+    assert second.calls == []

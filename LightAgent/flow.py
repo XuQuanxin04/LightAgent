@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -139,7 +140,8 @@ class LightFlow:
         self._records: dict[str, dict[str, Any]] = {}
         self._approval_decisions: dict[tuple[str, str], ApprovalDecision] = {}
         self._approval_request_ids: dict[tuple[str, str], str] = {}
-        self._cancelled = False
+        self._execution_lock = Lock()
+        self._active_cancellations: set[Event] = set()
 
     def step(
             self,
@@ -230,8 +232,21 @@ class LightFlow:
         return {"errors": errors, "warnings": warnings}
 
     def cancel(self) -> None:
-        """Request cancellation before the next step starts."""
-        self._cancelled = True
+        """Request cancellation of every execution currently active on this flow."""
+        with self._execution_lock:
+            active = tuple(self._active_cancellations)
+        for cancellation in active:
+            cancellation.set()
+
+    def _start_execution(self) -> Event:
+        cancellation = Event()
+        with self._execution_lock:
+            self._active_cancellations.add(cancellation)
+        return cancellation
+
+    def _finish_execution(self, cancellation: Event) -> None:
+        with self._execution_lock:
+            self._active_cancellations.discard(cancellation)
 
     def run(
             self,
@@ -245,19 +260,24 @@ class LightFlow:
             run_group_id: str | None = None,
     ) -> LightFlowResult | str | dict[str, Any]:
         """Run all registered steps once their dependencies are satisfied."""
-        if result_format not in ("object", "str", "dict"):
-            raise ValueError("result_format must be one of: object, str, dict")
-        ordered_steps = self._ordered_steps()
-        return self._execute(
-            query=query,
-            ordered_steps=ordered_steps,
-            user_id=user_id,
-            trace=trace,
-            result_format=result_format,
-            run_id=run_id or uuid4().hex,
-            parent_trace_id=parent_trace_id,
-            run_group_id=run_group_id,
-        )
+        cancellation = self._start_execution()
+        try:
+            if result_format not in ("object", "str", "dict"):
+                raise ValueError("result_format must be one of: object, str, dict")
+            ordered_steps = self._ordered_steps()
+            return self._execute(
+                query=query,
+                ordered_steps=ordered_steps,
+                user_id=user_id,
+                trace=trace,
+                result_format=result_format,
+                run_id=run_id or uuid4().hex,
+                parent_trace_id=parent_trace_id,
+                run_group_id=run_group_id,
+                cancellation=cancellation,
+            )
+        finally:
+            self._finish_execution(cancellation)
 
     async def arun(self, query: str, **kwargs: Any) -> LightFlowResult | str | dict[str, Any]:
         """Run a workflow without blocking the caller's event loop."""
@@ -274,28 +294,33 @@ class LightFlow:
             run_group_id: str | None = None,
     ) -> LightFlowResult | str | dict[str, Any]:
         """Resume a failed or incomplete run from the last checkpoint."""
-        record = self.get_run(run_id)
-        if not record:
-            raise ValueError(f"run `{run_id}` not found")
-        self._restore_approval_decisions(run_id, record)
-        self._run_flow_hook("on_resume", {"run_id": run_id, "record": record})
-        completed = {
-            step["name"]: self._step_result_from_dict(step)
-            for step in record.get("steps", [])
-            if step.get("status") == FLOW_SUCCESS
-        }
-        ordered_steps = [step for step in self._ordered_steps() if step.name not in completed]
-        return self._execute(
-            query=record.get("query", ""),
-            ordered_steps=ordered_steps,
-            user_id=user_id,
-            trace=trace,
-            result_format=result_format,
-            run_id=run_id,
-            initial_completed=completed,
-            parent_trace_id=parent_trace_id,
-            run_group_id=run_group_id,
-        )
+        cancellation = self._start_execution()
+        try:
+            record = self.get_run(run_id)
+            if not record:
+                raise ValueError(f"run `{run_id}` not found")
+            self._restore_approval_decisions(run_id, record)
+            self._run_flow_hook("on_resume", {"run_id": run_id, "record": record})
+            completed = {
+                step["name"]: self._step_result_from_dict(step)
+                for step in record.get("steps", [])
+                if step.get("status") == FLOW_SUCCESS
+            }
+            ordered_steps = [step for step in self._ordered_steps() if step.name not in completed]
+            return self._execute(
+                query=record.get("query", ""),
+                ordered_steps=ordered_steps,
+                user_id=user_id,
+                trace=trace,
+                result_format=result_format,
+                run_id=run_id,
+                initial_completed=completed,
+                parent_trace_id=parent_trace_id,
+                run_group_id=run_group_id,
+                cancellation=cancellation,
+            )
+        finally:
+            self._finish_execution(cancellation)
 
     def rerun_step(
             self,
@@ -309,6 +334,33 @@ class LightFlow:
             run_group_id: str | None = None,
     ) -> LightFlowResult | str | dict[str, Any]:
         """Rerun one step and all downstream steps from a checkpoint."""
+        cancellation = self._start_execution()
+        try:
+            return self._rerun_step_execution(
+                run_id,
+                step_name,
+                user_id=user_id,
+                trace=trace,
+                result_format=result_format,
+                parent_trace_id=parent_trace_id,
+                run_group_id=run_group_id,
+                cancellation=cancellation,
+            )
+        finally:
+            self._finish_execution(cancellation)
+
+    def _rerun_step_execution(
+            self,
+            run_id: str,
+            step_name: str,
+            *,
+            user_id: str,
+            trace: bool,
+            result_format: str,
+            parent_trace_id: str | None,
+            run_group_id: str | None,
+            cancellation: Event,
+    ) -> LightFlowResult | str | dict[str, Any]:
         record = self.get_run(run_id)
         if not record:
             raise ValueError(f"run `{run_id}` not found")
@@ -338,6 +390,7 @@ class LightFlow:
             initial_completed=completed,
             parent_trace_id=parent_trace_id,
             run_group_id=run_group_id,
+            cancellation=cancellation,
         )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -400,13 +453,8 @@ class LightFlow:
             initial_completed: dict[str, LightFlowStepResult] | None = None,
             parent_trace_id: str | None = None,
             run_group_id: str | None = None,
+            cancellation: Event,
     ) -> LightFlowResult | str | dict[str, Any]:
-        # A new execution must not inherit the cancellation state of a previous
-        # run on the same LightFlow instance. cancel() is still honored for the
-        # currently executing run because the flag is re-checked before every
-        # step below; resetting it here only prevents it from permanently
-        # poisoning subsequent run()/resume()/rerun_step() calls.
-        self._cancelled = False
         trace_id = uuid4().hex
         run_group = run_group_id or run_id
         recorder = TraceRecorder(enabled=trace, trace_id=trace_id, parent_trace_id=parent_trace_id, run_group_id=run_group)
@@ -430,7 +478,7 @@ class LightFlow:
         error = None
 
         for step in ordered_steps:
-            if self._cancelled or (step.cancel_if and step.cancel_if(context)):
+            if cancellation.is_set() or (step.cancel_if and step.cancel_if(context)):
                 result = self._skipped_result(step, "cancelled before execution")
                 step_results.append(result)
                 self._checkpoint(run_id, query, status=FLOW_SKIPPED, steps=step_results, error=result.error, all_steps=all_steps)
