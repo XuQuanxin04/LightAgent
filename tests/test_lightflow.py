@@ -344,3 +344,18 @@ def test_lightflow_marks_step_failed_when_agent_always_raises_without_fallback()
     assert result.steps[1].status == "skipped"
     assert downstream.calls == []
 
+
+def test_lightflow_does_not_expose_agent_exception_details():
+    class SecretRaisingAgent:
+        name = "secret"
+
+        def run(self, query, **kwargs):
+            raise RuntimeError("Authorization: Bearer secret-token")
+
+    result = LightFlow().step("secret", agent=SecretRaisingAgent()).run("go")
+
+    assert result.success is False
+    assert "RuntimeError" in result.error
+    assert "secret-token" not in result.error
+    assert "Authorization" not in result.error
+

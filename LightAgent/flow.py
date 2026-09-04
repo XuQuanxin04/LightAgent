@@ -691,7 +691,7 @@ class LightFlow:
                 raw_result, timed_out = None, False
                 content = (
                     f"[LA-FLOW-AGENT-ERROR] step `{step.name}` agent raised "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}"
                 )
                 error, step_trace = content, []
             else:
@@ -732,7 +732,7 @@ class LightFlow:
                 fallback_result, timed_out = None, False
                 content = (
                     f"[LA-FLOW-AGENT-ERROR] fallback for step `{step.name}` agent raised "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}"
                 )
                 error, step_trace = content, []
             else:
